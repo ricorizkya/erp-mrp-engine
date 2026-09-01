@@ -1,33 +1,135 @@
 package domain
 
-// BomExploder — pure logic, tidak boleh ada DB/Redis call di sini.
-// Implementasi asli (recursive explosion, net requirement calc) belum
-// ditulis di stub ini — lihat test case wajib di spec section 6.4
-// sebelum Task 3.2 dianggap selesai:
-//
-//   1. Single-level BOM, qty bulat
-//   2. Multi-level BOM (3+ level nested)
-//   3. Qty pecahan (rounding error tidak boleh terakumulasi)
-//   4. Circular BOM reference — harus return error, bukan infinite loop
-//   5. BOM versioning — pakai versi aktif sesuai effective_date
-//   6. Nested manufactured item (komponen yang punya BOM sendiri)
-//   7. BOM kosong / produk tanpa BOM terdaftar — return error jelas
-//   8. Net requirement dikurangi stock on hand, bukan gross requirement
-//
-// Struct BomComponent di bawah cuma placeholder minimal untuk stub
-// worker bisa compile dan dites end-to-end sebelum logic asli ditulis.
+import (
+	"fmt"
+	"time"
+)
 
-type BomComponent struct {
-	VariantID       int64
-	QuantityPerUnit float64
-	ScrapPct        float64
-	IsPhantom       bool
+// BomExploder melakukan dekomposisi Bill of Materials (BOM)
+// menjadi daftar kebutuhan sub-komponen (SubDemand).
+type BomExploder struct {
+	input    *InputData
+	maxDepth int
 }
 
-// Explode adalah stub — return slice kosong. Implementasi asli
-// (recursive CTE hasil query dibawa ke Go, atau full recursion di Go)
-// perlu didesain terpisah dan ditest lewat 8 kasus di atas sebelum
-// dipakai worker.go untuk kalkulasi sungguhan.
-func Explode(bomVersionID int64, quantity float64) ([]BomComponent, error) {
-	return []BomComponent{}, nil
+// NewBomExploder membuat instance BomExploder baru.
+func NewBomExploder(input *InputData, maxDepth int) *BomExploder {
+	if maxDepth <= 0 {
+		maxDepth = 10
+	}
+	return &BomExploder{
+		input:    input,
+		maxDepth: maxDepth,
+	}
+}
+
+// Explode menjalankan dekomposisi untuk suatu versi BOM dan quantity produk induk yang dibutuhkan.
+// Item berstatus phantom akan di-explode tembus langsung ke sub-BOM-nya.
+// Komponen yang bukan phantom akan menghasilkan SubDemand (yang nantinya jika merupakan semi-finished good
+// akan dihitung net requirement-nya oleh Calculator sebelum sub-BOM-nya di-explode).
+func (e *BomExploder) Explode(
+	bomVersionID int64,
+	parentQuantity float64,
+	neededDate time.Time,
+	warehouseID int64,
+) ([]SubDemand, error) {
+	if parentQuantity <= 0 {
+		return []SubDemand{}, nil
+	}
+
+	visited := make(map[int64]bool)
+	var subDemands []SubDemand
+
+	err := e.explodeRecursive(
+		bomVersionID,
+		parentQuantity,
+		neededDate,
+		warehouseID,
+		1,
+		visited,
+		&subDemands,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return subDemands, nil
+}
+
+func (e *BomExploder) explodeRecursive(
+	bomVersionID int64,
+	parentQuantity float64,
+	neededDate time.Time,
+	warehouseID int64,
+	depth int,
+	visited map[int64]bool,
+	subDemands *[]SubDemand,
+) error {
+	if depth > e.maxDepth {
+		return fmt.Errorf("max BOM depth (%d) exceeded at bom version %d", e.maxDepth, bomVersionID)
+	}
+
+	if visited[bomVersionID] {
+		return fmt.Errorf("circular BOM reference detected at bom version %d", bomVersionID)
+	}
+	visited[bomVersionID] = true
+	defer func() {
+		delete(visited, bomVersionID)
+	}()
+
+	items, exists := e.input.BomItems[bomVersionID]
+	if !exists || len(items) == 0 {
+		return nil
+	}
+
+	outputQty := e.input.BomOutputQty[bomVersionID]
+	if outputQty <= 0 {
+		outputQty = 1.0
+	}
+	ratio := parentQuantity / outputQty
+
+	for _, item := range items {
+		// Hanya proses item tingkat atas dari BOM versi ini (parent_item_id IS NULL)
+		if item.ParentItemID != nil {
+			continue
+		}
+
+		qtyWithScrap := item.QuantityWithScrap
+		if qtyWithScrap <= 0 {
+			qtyWithScrap = item.Quantity * (1.0 + (item.ScrapPct / 100.0))
+		}
+		requiredQty := ratio * qtyWithScrap
+
+		if item.IsPhantom {
+			// Phantom item: tidak di-stok dan tidak dibuatkan order, langsung tembus ke sub-BOM-nya
+			subBomID, hasSubBom := e.input.ActiveBoms[item.VariantID]
+			if hasSubBom {
+				if err := e.explodeRecursive(
+					subBomID,
+					requiredQty,
+					neededDate,
+					warehouseID,
+					depth+1,
+					visited,
+					subDemands,
+				); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		// Non-phantom item: tambahkan sebagai SubDemand
+		*subDemands = append(*subDemands, SubDemand{
+			VariantID:       item.VariantID,
+			Quantity:        requiredQty,
+			UomID:           item.UomID,
+			NeededDate:      neededDate,
+			WarehouseID:     warehouseID,
+			ParentVariantID: item.VariantID,
+			Depth:           depth,
+		})
+	}
+
+	return nil
 }

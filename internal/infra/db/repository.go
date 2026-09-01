@@ -5,16 +5,14 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+
+	"erp-mrp-engine/internal/domain"
+	"erp-mrp-engine/internal/infra/db/queries"
 )
 
-// MarkRunning — operasi PERTAMA dan paling ringan setelah job di-pickup,
-// SEBELUM kalkulasi berat mulai. WHERE status='pending' (bukan cuma
-// WHERE id=$1) sebagai defense terhadap race condition kalau suatu
-// saat ada >1 Go worker instance — lihat spec section 4.
-//
-// Kalau RowsAffected() == 0, berarti run ini sudah dipegang worker lain
-// atau statusnya bukan 'pending' lagi — caller HARUS treat ini sebagai
-// sinyal untuk skip job, bukan lanjut proses.
+// MarkRunning menandai mrp_runs sebagai 'running' dan mencatat started_at serta job_schema_version.
+// Pengecekan WHERE status = 'pending' berfungsi sebagai perlindungan terhadap race condition antar worker.
+// Mengembalikan true jika baris berhasil diupdate, atau false jika status bukan 'pending' lagi.
 func MarkRunning(ctx context.Context, tx pgx.Tx, runID int64, schemaVersion int) (bool, error) {
 	tag, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
@@ -28,11 +26,21 @@ func MarkRunning(ctx context.Context, tx pgx.Tx, runID int64, schemaVersion int)
 	return tag.RowsAffected() > 0, nil
 }
 
-// MarkFailedPermanent — dipakai untuk schemaVersion mismatch (skip retry
-// sepenuhnya, lihat spec section 6.2) maupun setelah retry_count habis
-// (dipanggil dari reconciliation NestJS, bukan dari sini — fungsi ini
-// untuk kasus Go sendiri yang menentukan gagal permanen, misal version
-// mismatch terdeteksi saat parse job).
+// MarkFailed mencatat kegagalan transien pada mrp_runs sehingga dapat direkonsiliasi dan diretry oleh NestJS.
+func MarkFailed(ctx context.Context, tx pgx.Tx, runID int64, reason string) error {
+	_, err := tx.Exec(ctx,
+		`UPDATE mrp_runs
+		 SET status = 'failed', error_message = $2, completed_at = NOW()
+		 WHERE id = $1`,
+		runID, reason,
+	)
+	if err != nil {
+		return fmt.Errorf("mark failed: %w", err)
+	}
+	return nil
+}
+
+// MarkFailedPermanent mencatat kegagalan permanen (seperti schemaVersion mismatch) yang tidak boleh diretry.
 func MarkFailedPermanent(ctx context.Context, tx pgx.Tx, runID int64, reason string) error {
 	_, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
@@ -46,45 +54,82 @@ func MarkFailedPermanent(ctx context.Context, tx pgx.Tx, runID int64, reason str
 	return nil
 }
 
-// CompleteRun — update status final + insert planned_orders dalam SATU
-// transaksi (caller wajib pass tx yang sama, commit/rollback di level
-// caller). Ini enforce keputusan spec section 4: status dan hasil tidak
-// boleh jadi dua operasi terpisah.
-//
-// STUB: insert planned_orders belum diimplementasi (exploder masih
-// placeholder di internal/domain/bom_exploder.go). Fungsi ini untuk
-// sekarang cuma update status + total counter ke 0, supaya pipeline
-// end-to-end (job masuk -> status berubah -> job selesai) bisa divalidasi
-// dulu sebelum logic kalkulasi asli ditulis.
-func CompleteRun(ctx context.Context, tx pgx.Tx, runID int64, totalProduction, totalPurchase int) error {
+// WriteResults menyimpan seluruh hasil kalkulasi MRP ke database dalam satu transaksi:
+// 1. Bulk insert planned_orders dan mendapatkan daftar ID hasil insert
+// 2. Memetakan ID planned_orders ke planned_order_demands lalu bulk insert
+// 3. Bulk update status mrp_demands menjadi 'planned'
+// 4. Update status mrp_runs menjadi 'completed' beserta ringkasan statistik dan durasi
+func WriteResults(ctx context.Context, tx pgx.Tx, runID int64, result *domain.CalcResult, durationMs int64) error {
+	if result == nil {
+		return fmt.Errorf("cannot write nil calc result for run %d", runID)
+	}
+
+	// 1. Bulk insert planned_orders
+	orderIDs, err := queries.BulkInsertPlannedOrders(ctx, tx, result.PlannedOrders)
+	if err != nil {
+		return fmt.Errorf("bulk insert planned orders: %w", err)
+	}
+
+	// 2. Hubungkan ID yang dihasilkan ke relasi planned_order_demands
+	var allDemandsLinks []domain.PlannedOrderDemand
+	for i, order := range result.PlannedOrders {
+		if i < len(orderIDs) {
+			assignedID := orderIDs[i]
+			for _, demandLink := range order.CoveredDemands {
+				demandLink.PlannedOrderID = assignedID
+				allDemandsLinks = append(allDemandsLinks, demandLink)
+			}
+		}
+	}
+
+	if len(allDemandsLinks) > 0 {
+		if err := queries.BulkInsertPlannedOrderDemands(ctx, tx, allDemandsLinks); err != nil {
+			return fmt.Errorf("bulk insert planned order demands: %w", err)
+		}
+	}
+
+	// 3. Update status demand yang ter-cover
+	if len(result.PlannedDemandIDs) > 0 {
+		if err := queries.BulkUpdateDemandStatus(ctx, tx, result.PlannedDemandIDs, "planned"); err != nil {
+			return fmt.Errorf("bulk update demand status: %w", err)
+		}
+	}
+
+	// 4. Update mrp_runs menjadi 'completed'
+	_, err = tx.Exec(ctx,
+		`UPDATE mrp_runs
+		 SET status = 'completed',
+		     completed_at = NOW(),
+		     total_planned_production = $2,
+		     total_planned_purchase = $3,
+		     duration_ms = $4
+		 WHERE id = $1`,
+		runID,
+		result.Stats.TotalProduction,
+		result.Stats.TotalPurchase,
+		durationMs,
+	)
+	if err != nil {
+		return fmt.Errorf("update mrp_runs completed: %w", err)
+	}
+
+	return nil
+}
+
+// CompleteRun adalah helper minimal untuk menandai mrp_runs selesai (berguna saat test pipeline stub).
+func CompleteRun(ctx context.Context, tx pgx.Tx, runID int64, totalProduction, totalPurchase int, durationMs int64) error {
 	_, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
 		 SET status = 'completed',
 		     completed_at = NOW(),
 		     total_planned_production = $2,
-		     total_planned_purchase = $3
+		     total_planned_purchase = $3,
+		     duration_ms = $4
 		 WHERE id = $1`,
-		runID, totalProduction, totalPurchase,
+		runID, totalProduction, totalPurchase, durationMs,
 	)
 	if err != nil {
 		return fmt.Errorf("complete run: %w", err)
-	}
-	// TODO: insert ke planned_orders + planned_order_demands di sini,
-	// dalam transaksi yang sama, setelah exploder logic asli ada.
-	return nil
-}
-
-// MarkFailed — kegagalan transient (bukan permanent), retry masih
-// mungkin lewat reconciliation NestJS.
-func MarkFailed(ctx context.Context, tx pgx.Tx, runID int64, reason string) error {
-	_, err := tx.Exec(ctx,
-		`UPDATE mrp_runs
-		 SET status = 'failed', error_message = $2, completed_at = NOW()
-		 WHERE id = $1`,
-		runID, reason,
-	)
-	if err != nil {
-		return fmt.Errorf("mark failed: %w", err)
 	}
 	return nil
 }

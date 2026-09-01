@@ -8,6 +8,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Pool adalah alias untuk *pgxpool.Pool.
+type Pool = pgxpool.Pool
+
 // NewPool membuat connection pool ke Postgres lewat PgBouncer.
 //
 // WAJIB: QueryExecMode di-set ke SimpleProtocol. PgBouncer transaction

@@ -2,201 +2,214 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
-	"strconv"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	gobullmq "go.codycody31.dev/gobullmq"
 
+	"erp-mrp-engine/internal/config"
 	"erp-mrp-engine/internal/domain"
 	infradb "erp-mrp-engine/internal/infra/db"
+	"erp-mrp-engine/internal/infra/mrp"
+	"erp-mrp-engine/internal/logger"
 )
 
-// ============================================================
-// STUB WORKER — untuk validasi end-to-end kontrak job, BUKAN
-// implementasi MRP calculation asli. Lihat internal/domain/bom_exploder.go
-// untuk status logic kalkulasi (masih placeholder).
-//
-// PERINGATAN KOMPATIBILITAS: gobullmq target BullMQ v4.12.2.
-// NestJS project ini rencananya pakai BullMQ v5.x (pin eksplisit,
-// hindari v6 yang baru rilis 30 Juli 2026 dengan pluggable backend
-// yang mengubah internal signifikan). WAJIB spike test sebelum
-// dipercaya: pastikan job.isActive() di sisi Node NestJS benar-benar
-// true selagi Go pegang job ini — kalau tidak, reconciliation design
-// (cek BullMQ sebelum retry) tidak valid dan perlu didesain ulang.
-// ============================================================
-
-type Config struct {
-	DatabaseURL string
-	RedisAddr   string
-	RedisPass   string
-	RedisDB     int
-	QueueName   string
-	Concurrency int
-}
-
-func loadConfig() Config {
-	if err := godotenv.Load(); err != nil {
-		log.Println("info: file .env tidak ditemukan atau tidak bisa dimuat, menggunakan environment variable sistem")
-	}
-
-	// 1. Database URL
-	dsn := os.Getenv("MRP_DATABASE_URL")
-	if dsn == "" {
-		dsn = os.Getenv("DATABASE_URL")
-	}
-	if dsn == "" {
-		host := getEnv("DB_HOST", "localhost")
-		port := getEnv("DB_PORT", "5432")
-		user := getEnv("DB_USER", "postgres")
-		pass := os.Getenv("DB_PASSWORD")
-		name := getEnv("DB_NAME", "postgres")
-		ssl := getEnv("DB_SSLMODE", "disable")
-
-		if pass != "" {
-			dsn = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, name, ssl)
-		} else {
-			dsn = fmt.Sprintf("postgres://%s@%s:%s/%s?sslmode=%s", user, host, port, name, ssl)
-		}
-	}
-	if dsn == "" {
-		log.Fatal("env MRP_DATABASE_URL atau DATABASE_URL wajib di-set")
-	}
-
-	// 2. Redis Configuration
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		if u := os.Getenv("REDIS_URL"); u != "" {
-			redisAddr = strings.TrimPrefix(u, "redis://")
-		} else {
-			host := getEnv("REDIS_HOST", "localhost")
-			port := getEnv("REDIS_PORT", "6379")
-			redisAddr = fmt.Sprintf("%s:%s", host, port)
-		}
-	}
-
-	redisPass := os.Getenv("REDIS_PASSWORD")
-	redisDB, _ := strconv.Atoi(getEnv("REDIS_DB", "0"))
-
-	// 3. Queue Name & Concurrency
-	queueName := getEnv("QUEUE_NAME", "mrp-calculation")
-	concurrency, _ := strconv.Atoi(getEnv("WORKER_CONCURRENCY", "1"))
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-
-	return Config{
-		DatabaseURL: dsn,
-		RedisAddr:   redisAddr,
-		RedisPass:   redisPass,
-		RedisDB:     redisDB,
-		QueueName:   queueName,
-		Concurrency: concurrency,
-	}
-}
-
-func getEnv(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultVal
-}
-
 func main() {
-	ctx := context.Background()
-
-	cfg := loadConfig()
-
-	pool, err := infradb.NewPool(ctx, cfg.DatabaseURL)
+	// 1. Muat konfigurasi aplikasi
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("db pool: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to load configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 2. Inisialisasi structured logger
+	log := logger.New(cfg.LogLevel, cfg.LogFormat)
+	log.Info("starting MRP calculation worker",
+		"queue", cfg.QueueName,
+		"concurrency", cfg.WorkerConcurrency,
+		"max_bom_depth", cfg.MaxBomDepth,
+		"app_env", cfg.AppEnv,
+	)
+
+	// 3. Konteks aplikasi dengan signal cancel untuk graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+
+	// 4. Inisialisasi PostgreSQL Connection Pool (dengan retry koneksi saat startup)
+	pool, err := initDatabasePool(ctx, cfg.DatabaseURL, cfg.RetryAttempts, log)
+	if err != nil {
+		log.Error("failed to connect to database pool", "error", err.Error())
+		os.Exit(1)
 	}
 	defer pool.Close()
 
+	// 5. Inisialisasi Redis Client
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPass,
-		DB:       cfg.RedisDB,
+		Addr: cfg.RedisAddr,
 	})
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			log.Warn("error closing redis client", "error", err.Error())
+		}
+	}()
 
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Error("failed to ping redis", "error", err.Error(), "addr", cfg.RedisAddr)
+		os.Exit(1)
+	}
+
+	// 6. Inisialisasi MRP Engine Orchestrator
+	engine := mrp.NewEngine(pool, cfg, log)
+
+	// 7. Mulai HTTP Health Check Server di background (untuk PM2 / container monitoring)
+	startHealthServer(ctx, pool, redisClient, log)
+
+	// 8. Inisialisasi BullMQ Worker
 	worker, err := gobullmq.NewWorker(
 		cfg.QueueName,
 		redisClient,
-		func(ctx context.Context, job *gobullmq.Job[domain.MrpJob]) (any, error) {
-			return processJob(ctx, pool, job.Data())
+		func(jobCtx context.Context, job *gobullmq.Job[domain.MrpJob]) (any, error) {
+			jobData := job.Data()
+			if err := engine.Run(jobCtx, &jobData); err != nil {
+				return nil, err
+			}
+			return nil, nil
 		},
 		&gobullmq.WorkerOptions{
-			Concurrency:     cfg.Concurrency,
+			Concurrency:     cfg.WorkerConcurrency,
 			StalledInterval: 30 * time.Second,
 		},
 	)
 	if err != nil {
-		log.Fatalf("create worker: %v", err)
+		log.Error("failed to initialize bullmq worker", "error", err.Error())
+		os.Exit(1)
 	}
 
-	log.Printf("mrp worker started (queue: %s, concurrency: %d)", cfg.QueueName, cfg.Concurrency)
-	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("run worker: %v", err)
-	}
-	worker.Wait()
-}
-
-func processJob(ctx context.Context, pool *pgxpool.Pool, job domain.MrpJob) (any, error) {
-
-	// Version check — reject + failed_permanent langsung, skip retry,
-	// sesuai keputusan spec section 6.2
-	if job.SchemaVersion != domain.SupportedSchemaVersion {
-		err := infradb.WithTenantSchema(ctx, pool, job.TenantSchema, func(tx pgx.Tx) error {
-			return infradb.MarkFailedPermanent(ctx, tx, job.RunID,
-				"schemaVersion mismatch: got "+strconv.Itoa(job.SchemaVersion)+", supported "+strconv.Itoa(domain.SupportedSchemaVersion))
-		})
-		if err != nil {
-			log.Printf("failed to mark failed_permanent for version mismatch, runId=%d: %v", job.RunID, err)
+	// Jalankan worker di goroutine
+	workerErrChan := make(chan error, 1)
+	go func() {
+		log.Info("mrp worker started", "queue", cfg.QueueName, "concurrency", cfg.WorkerConcurrency)
+		if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			workerErrChan <- err
 		}
-		return nil, nil // job dianggap "selesai" dari sisi BullMQ, tidak perlu di-retry BullMQ (attempts:1 sudah di-set NestJS)
+		close(workerErrChan)
+	}()
+
+	// 9. Tunggu sinyal shutdown atau worker error
+	select {
+	case <-ctx.Done():
+		log.Info("shutdown signal received, waiting for in-progress jobs to finish...")
+	case err := <-workerErrChan:
+		if err != nil {
+			log.Error("worker stopped unexpectedly", "error", err.Error())
+		}
 	}
 
-	// Mark running — operasi pertama, paling ringan
-	var picked bool
-	err := infradb.WithTenantSchema(ctx, pool, job.TenantSchema, func(tx pgx.Tx) error {
-		var e error
-		picked, e = infradb.MarkRunning(ctx, tx, job.RunID, job.SchemaVersion)
-		return e
-	})
-	if err != nil {
-		return nil, err
-	}
-	if !picked {
-		// Run sudah dipegang worker lain atau sudah selesai — skip,
-		// jangan proses ulang. Lihat catatan race condition di repository.go
-		log.Printf("runId=%d sudah tidak berstatus pending, skip", job.RunID)
-		return nil, nil
-	}
-
-	// STUB: kalkulasi MRP sungguhan belum ada. Sleep pendek untuk
-	// simulasi kerja, lalu langsung complete dengan hasil kosong —
-	// tujuannya cuma validasi pipeline job -> status transition -> commit.
-	time.Sleep(2 * time.Second)
-
-	err = infradb.WithTenantSchema(ctx, pool, job.TenantSchema, func(tx pgx.Tx) error {
-		return infradb.CompleteRun(ctx, tx, job.RunID, 0, 0)
-	})
-	if err != nil {
-		// Kalkulasi (stub) berhasil tapi commit gagal — treat sebagai
-		// failed (transient), reconciliation NestJS yang urus retry
-		_ = infradb.WithTenantSchema(ctx, pool, job.TenantSchema, func(tx pgx.Tx) error {
-			return infradb.MarkFailed(ctx, tx, job.RunID, err.Error())
-		})
-		return nil, err
-	}
-
-	return nil, nil
+	// Graceful wait
+	worker.Wait()
+	log.Info("mrp worker shutdown complete")
 }
 
+func initDatabasePool(
+	ctx context.Context,
+	dsn string,
+	maxAttempts int,
+	log *logger.Logger,
+) (*infradb.Pool, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		pool, err := infradb.NewPool(ctx, dsn)
+		if err == nil {
+			if err = pool.Ping(ctx); err == nil {
+				return pool, nil
+			}
+			pool.Close()
+			lastErr = err
+		} else {
+			lastErr = err
+		}
+
+		log.Warn("database connection attempt failed, retrying...",
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"error", lastErr.Error(),
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+
+	return nil, fmt.Errorf("could not connect to database after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func startHealthServer(
+	ctx context.Context,
+	pool *infradb.Pool,
+	redisClient *redis.Client,
+	log *logger.Logger,
+) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		dbStatus := "ok"
+		if err := pool.Ping(r.Context()); err != nil {
+			dbStatus = "down"
+		}
+
+		redisStatus := "ok"
+		if err := redisClient.Ping(r.Context()).Err(); err != nil {
+			redisStatus = "down"
+		}
+
+		status := "ok"
+		httpStatus := http.StatusOK
+		if dbStatus != "ok" || redisStatus != "ok" {
+			status = "degraded"
+			httpStatus = http.StatusServiceUnavailable
+		}
+
+		resp := map[string]string{
+			"status": status,
+			"db":     dbStatus,
+			"redis":  redisStatus,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpStatus)
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Warn("health check server stopped", "error", err.Error())
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+}
