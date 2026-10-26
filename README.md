@@ -40,16 +40,15 @@ menulis output ke `planned_orders` + `planned_order_demands`.
 | Komponen | Status | Keterangan |
 |---|---|---|
 | Spike test BullMQ ↔ Go | ✅ Lolos | `pending → running → completed` terverifikasi end-to-end |
-| Stub worker (status pipeline) | ✅ Berjalan | Job masuk, status update, selesai |
-| DB connection pool + tenant schema | ✅ Solid | `pgx` + `SimpleProtocol`, `WithTenantSchema` |
+| Worker state machine | ✅ Berjalan | Claim pendek `pending → running`, guarded writer, retry/failure transitions |
+| DB connection pool + tenant schema | ✅ Solid | `pgx` pool dengan `SET LOCAL search_path` per transaksi |
 | Job contract parsing | ✅ Solid | `schemaVersion`, BIGINT IDs, RFC3339 dates |
-| BOM Exploder logic | ⚠️ Stub | Placeholder, return kosong — belum diimplementasi |
-| Net requirement calculator | ❌ Belum ada | |
-| Backward scheduler | ❌ Belum ada | |
-| DB queries (load + write) | ❌ Belum ada | Hanya status update, belum planned_orders insert |
-| Unit tests | ❌ Belum ada | Target coverage ≥ 70% |
-| Integration tests | ❌ Belum ada | 8 skenario dari spec |
-| Dockerfile | ❌ Belum ada | |
+| BOM exploder + net requirement | ✅ Berjalan | Unit-tested multi-level BOM, stock, on-order, phantom, dan over-demand |
+| Backward scheduler | ✅ Berjalan | Lead time dan overdue demand diuji |
+| DB load/write pipeline | ✅ Berjalan | Idempotent planned-order writer dan demand status update |
+| Unit/race tests | ✅ Lulus | `go test ./...` dan `go test -race ./...` |
+| Tagged integration tests | ✅ Lulus lokal | `TEST_DATABASE_URL` wajib menunjuk database test; schema dibuat terisolasi |
+| Dockerfile + supervisor | ✅ Tersedia | Dockerfile dan systemd/supervisor artefak sudah ada |
 
 > Lihat `docs/mrp-engine-full-plan.md` untuk task list lengkap dan estimasi waktu.
 
@@ -58,7 +57,7 @@ menulis output ke `planned_orders` + `planned_order_demands`.
 ## Prerequisites
 
 - **Go 1.22+** (project pakai Go 1.25, min requirement Go 1.22 untuk `range-over-func`)
-- **PostgreSQL 16** dengan schema tenant yang sudah dijalankan migration 001-012
+- **PostgreSQL 16** dengan schema tenant yang sudah dijalankan migration 001-016
 - **Redis 7+** — instance yang sama dengan NestJS backend
 - **PgBouncer** — Go connect lewat PgBouncer (transaction mode), bukan direct ke Postgres
 - Role Postgres `mrp_service` sudah dibuat via `004_create_mrp_service_role.sql`
@@ -107,7 +106,7 @@ go test ./...
 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
-# Integration tests (butuh DB lokal dengan migration sudah jalan)
+# Integration tests (database/schema test dibuat ulang oleh helper)
 TEST_DATABASE_URL="postgres://..." go test -tags integration ./...
 
 # Race condition detection
