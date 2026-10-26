@@ -73,17 +73,26 @@ func (e *Engine) Run(ctx context.Context, job *domain.MrpJob) (err error) {
 		}
 	}()
 
-	// 3. Eksekusi seluruh proses di dalam transaksi tenant yang terisolasi
+	// 3. Claim the run in a short transaction so other connections can see running.
+	var acquired bool
 	err = db.WithTenantSchema(ctx, e.pool, job.TenantSchema, func(tx pgx.Tx) error {
-		// A. Tandai 'running'
 		isAcquired, markErr := db.MarkRunning(ctx, tx, job.RunID, job.SchemaVersion)
 		if markErr != nil {
 			return fmt.Errorf("mark running: %w", markErr)
 		}
-		if !isAcquired {
-			log.WarnContext(ctx, "job skipped: status was not pending or already claimed by another worker")
-			return nil
-		}
+		acquired = isAcquired
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		log.WarnContext(ctx, "job skipped: status was not pending or already claimed by another worker")
+		return nil
+	}
+
+	// 4. Load, calculate, and write in a separate transaction.
+	err = db.WithTenantSchema(ctx, e.pool, job.TenantSchema, func(tx pgx.Tx) error {
 
 		// B. Load input data
 		inputData, loadErr := e.loader.LoadAll(ctx, tx, job.RunID, job.TenantSchema, job.PlanFrom, job.PlanTo)

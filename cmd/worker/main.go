@@ -51,9 +51,14 @@ func main() {
 	defer pool.Close()
 
 	// 5. Inisialisasi Redis Client
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr,
-	})
+	var redisClient *redis.Client
+	if opt, err := redis.ParseURL(cfg.RedisAddr); err == nil {
+		redisClient = redis.NewClient(opt)
+	} else {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr: cfg.RedisAddr,
+		})
+	}
 	defer func() {
 		if err := redisClient.Close(); err != nil {
 			log.Warn("error closing redis client", "error", err.Error())

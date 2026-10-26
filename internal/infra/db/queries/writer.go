@@ -174,3 +174,30 @@ func BulkUpdateDemandStatus(ctx context.Context, tx pgx.Tx, demandIDs []int64, s
 
 	return nil
 }
+
+// DeletePlannedOrdersByRunID menghapus seluruh planned_orders dan relasi planned_order_demands
+// yang terikat pada mrp_run_id tertentu untuk memastikan idempotensi saat job di-retry.
+func DeletePlannedOrdersByRunID(ctx context.Context, tx pgx.Tx, runID int64) error {
+	// 1. Hapus relasi anak di planned_order_demands terlebih dahulu
+	_, err := tx.Exec(ctx,
+		`DELETE FROM planned_order_demands
+		 WHERE planned_order_id IN (
+			SELECT id FROM planned_orders WHERE mrp_run_id = $1
+		 )`,
+		runID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete existing planned order demands by run_id: %w", err)
+	}
+
+	// 2. Hapus planned_orders untuk run_id ini
+	_, err = tx.Exec(ctx,
+		`DELETE FROM planned_orders WHERE mrp_run_id = $1`,
+		runID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete existing planned orders by run_id: %w", err)
+	}
+
+	return nil
+}

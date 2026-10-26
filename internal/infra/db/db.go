@@ -45,14 +45,12 @@ func WithTenantSchema(ctx context.Context, pool *pgxpool.Pool, tenantSchema stri
 	}
 	defer tx.Rollback(ctx) // no-op kalau sudah di-commit
 
-	// search_path pakai format() bukan parameterized query karena
-	// SET tidak mendukung placeholder ($1) di PostgreSQL. Nama schema
-	// datang dari job contract (tenantSchema field), BUKAN dari input
-	// user langsung — tapi tetap validasi format sebelum sampai sini
-	// (lihat validasi regex ^tenant_[a-z0-9_]+$ di schema JSON) untuk
-	// mencegah SQL injection lewat schema name.
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET search_path TO %s, public", pgx.Identifier{tenantSchema}.Sanitize())); err != nil {
-		return fmt.Errorf("set search_path: %w", err)
+	// Gunakan SET LOCAL agar search_path scoped hanya untuk transaksi ini.
+	// Pada PgBouncer transaction pooling mode, SET biasa yang ter-commit akan
+	// menempel di koneksi server dan berisiko bocor ke client/tenant lain.
+	// SET LOCAL otomatis di-reset saat COMMIT atau ROLLBACK.
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", pgx.Identifier{tenantSchema}.Sanitize())); err != nil {
+		return fmt.Errorf("set local search_path: %w", err)
 	}
 
 	if err := fn(tx); err != nil {

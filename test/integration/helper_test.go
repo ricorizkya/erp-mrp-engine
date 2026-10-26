@@ -4,8 +4,12 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +24,8 @@ import (
 
 const TestTenantSchema = "tenant_test_mrp"
 
+var testDatabaseMarker = regexp.MustCompile(`(^|[_-])test([_-]|$)`)
+
 type TestFixture struct {
 	Pool   *pgxpool.Pool
 	Engine *mrp.Engine
@@ -32,7 +38,10 @@ func setupTestFixture(t *testing.T) *TestFixture {
 
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://synkro_erp:SynkroERP1826!@localhost:5432/new_erp?sslmode=disable"
+		t.Fatal("TEST_DATABASE_URL is required for integration tests")
+	}
+	if err := validateTestDatabaseURL(dsn); err != nil {
+		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -40,13 +49,13 @@ func setupTestFixture(t *testing.T) *TestFixture {
 
 	pool, err := infradb.NewPool(ctx, dsn)
 	if err != nil {
-		t.Skipf("skipping integration test: failed to connect to database: %v", err)
+		t.Fatalf("integration database connection failed: %v", err)
 		return nil
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		t.Skipf("skipping integration test: database ping failed: %v", err)
+		t.Fatalf("integration database ping failed: %v", err)
 		return nil
 	}
 
@@ -67,6 +76,28 @@ func setupTestFixture(t *testing.T) *TestFixture {
 		Engine: engine,
 		Log:    log,
 	}
+}
+
+func validateTestDatabaseURL(dsn string) error {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("TEST_DATABASE_URL is invalid: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return errors.New(
+			"TEST_DATABASE_URL is invalid: scheme and host are required",
+		)
+	}
+
+	databaseName := strings.Trim(parsed.Path, "/")
+	if !testDatabaseMarker.MatchString(strings.ToLower(databaseName)) {
+		return fmt.Errorf(
+			"refusing unsafe integration database %q: name must contain a standalone test marker",
+			databaseName,
+		)
+	}
+
+	return nil
 }
 
 func setupTestSchema(t *testing.T, pool *pgxpool.Pool) {

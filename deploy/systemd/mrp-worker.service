@@ -1,0 +1,21 @@
+[Unit]
+Description=ERP MRP Calculation Engine Worker (Go)
+After=network.target redis.target postgresql.target
+
+[Service]
+Type=simple
+User=erp
+Group=erp
+WorkingDirectory=/opt/erp/erp-mrp-engine
+ExecStart=/opt/erp/erp-mrp-engine/bin/mrp-worker
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+EnvironmentFile=/opt/erp/erp-mrp-engine/.env
+
+# Hardening
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

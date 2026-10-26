@@ -31,7 +31,7 @@ func MarkFailed(ctx context.Context, tx pgx.Tx, runID int64, reason string) erro
 	_, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
 		 SET status = 'failed', error_message = $2, completed_at = NOW()
-		 WHERE id = $1`,
+		 WHERE id = $1 AND status = 'running'`,
 		runID, reason,
 	)
 	if err != nil {
@@ -45,7 +45,7 @@ func MarkFailedPermanent(ctx context.Context, tx pgx.Tx, runID int64, reason str
 	_, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
 		 SET status = 'failed_permanent', error_message = $2, completed_at = NOW()
-		 WHERE id = $1`,
+		 WHERE id = $1 AND status IN ('pending', 'running')`,
 		runID, reason,
 	)
 	if err != nil {
@@ -55,6 +55,7 @@ func MarkFailedPermanent(ctx context.Context, tx pgx.Tx, runID int64, reason str
 }
 
 // WriteResults menyimpan seluruh hasil kalkulasi MRP ke database dalam satu transaksi:
+// 0. Bersihkan planned_orders lama jika ada untuk runID ini (idempotency retry)
 // 1. Bulk insert planned_orders dan mendapatkan daftar ID hasil insert
 // 2. Memetakan ID planned_orders ke planned_order_demands lalu bulk insert
 // 3. Bulk update status mrp_demands menjadi 'planned'
@@ -62,6 +63,19 @@ func MarkFailedPermanent(ctx context.Context, tx pgx.Tx, runID int64, reason str
 func WriteResults(ctx context.Context, tx pgx.Tx, runID int64, result *domain.CalcResult, durationMs int64) error {
 	if result == nil {
 		return fmt.Errorf("cannot write nil calc result for run %d", runID)
+	}
+
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM mrp_runs WHERE id = $1 FOR UPDATE`, runID).Scan(&status); err != nil {
+		return fmt.Errorf("lock mrp run: %w", err)
+	}
+	if status != "running" {
+		return fmt.Errorf("mrp run %d is %s; results discarded", runID, status)
+	}
+
+	// 0. Bersihkan planned orders lama untuk menjamin idempotensi jika run ini di-retry
+	if err := queries.DeletePlannedOrdersByRunID(ctx, tx, runID); err != nil {
+		return fmt.Errorf("delete existing planned orders: %w", err)
 	}
 
 	// 1. Bulk insert planned_orders
@@ -96,14 +110,14 @@ func WriteResults(ctx context.Context, tx pgx.Tx, runID int64, result *domain.Ca
 	}
 
 	// 4. Update mrp_runs menjadi 'completed'
-	_, err = tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`UPDATE mrp_runs
 		 SET status = 'completed',
 		     completed_at = NOW(),
 		     total_planned_production = $2,
 		     total_planned_purchase = $3,
 		     duration_ms = $4
-		 WHERE id = $1`,
+			 WHERE id = $1 AND status = 'running'`,
 		runID,
 		result.Stats.TotalProduction,
 		result.Stats.TotalPurchase,
@@ -111,6 +125,9 @@ func WriteResults(ctx context.Context, tx pgx.Tx, runID int64, result *domain.Ca
 	)
 	if err != nil {
 		return fmt.Errorf("update mrp_runs completed: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mrp run %d was no longer running", runID)
 	}
 
 	return nil

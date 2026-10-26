@@ -422,11 +422,12 @@ func TestIntegration_Scenario7_OverdueDemand(t *testing.T) {
 	cleanTestTables(t, fixture.Pool)
 
 	ctx := context.Background()
-	planFrom := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	planTo := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	planFrom := today
+	planTo := today.AddDate(0, 1, 0)
 
 	// Needed date 2 hari lagi tapi lead time pembelian butuh 14 hari -> planned_start disesuaikan ke hari ini dan is_overdue=true
-	neededDate := time.Now().AddDate(0, 0, 2)
+	neededDate := today.AddDate(0, 0, 2)
 
 	_, err := fixture.Pool.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO %s.product_variants (id, sku, lead_time_days) VALUES (107, 'IMPORT-FABRIC-SILK', 14);
@@ -461,8 +462,7 @@ func TestIntegration_Scenario7_OverdueDemand(t *testing.T) {
 		t.Fatalf("failed to query planned order: %v", err)
 	}
 
-	today := time.Now().UTC().Truncate(24 * time.Hour)
-	if plannedStart.UTC().Truncate(24*time.Hour).Before(today) {
+	if plannedStart.UTC().Truncate(24 * time.Hour).Before(today) {
 		t.Errorf("expected planned_start not to be before today (%v), got %v", today, plannedStart)
 	}
 }
