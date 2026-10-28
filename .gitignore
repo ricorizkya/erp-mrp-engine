@@ -1,0 +1,14 @@
+.gitignore
+.DS_Store
+.agents
+.claude
+docs
+.env
+.env.example
+!.env.example
+.dockerignore
+Dockerfile
+coverage.out
+worker
+mrp-engine
+*.log
