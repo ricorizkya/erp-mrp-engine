@@ -60,7 +60,9 @@ menulis output ke `planned_orders` + `planned_order_demands`.
 - **PostgreSQL 16** dengan schema tenant yang sudah dijalankan migration 001-016
 - **Redis 7+** — instance yang sama dengan NestJS backend
 - **PgBouncer** — Go connect lewat PgBouncer (transaction mode), bukan direct ke Postgres
-- Role Postgres `mrp_service` sudah dibuat via `004_create_mrp_service_role.sql`
+- Role Postgres `mrp_service` dibuat tanpa password oleh migration public
+  `007_create_mrp_service_role.sql`, lalu password login dipasang dari secret lokal
+  melalui `npm run db:provision-mrp-role` di backend
 
 ---
 
@@ -146,21 +148,20 @@ erp-mrp-engine/
 │   └── worker/
 │       └── main.go              ← entrypoint: init config, DB, Redis, start worker
 ├── internal/
-│   ├── config/                  ← [belum ada] env var loading + validation
-│   ├── logger/                  ← [belum ada] structured JSON logging (log/slog wrapper)
-│   ├── utils/                   ← [belum ada] date calculation helpers
+│   ├── config/                  ← env loading + validation
+│   ├── logger/                  ← structured logging
+│   ├── utils/                   ← date helpers
 │   ├── domain/                  ← pure logic — tidak ada DB/Redis call di sini
 │   │   ├── models.go            ← domain models (MrpJob, PlannedOrder, dll)
-│   │   ├── bom_exploder.go      ← [stub] recursive BOM explosion
-│   │   ├── calculator.go        ← [belum ada] net requirement calculation
-│   │   └── scheduler.go         ← [belum ada] backward scheduling dari lead time
+│   │   ├── bom_exploder.go      ← recursive multi-level BOM explosion
+│   │   ├── calculator.go        ← net requirement calculation
+│   │   └── scheduler.go         ← backward scheduling dari lead time
 │   └── infra/
 │       ├── db/
 │       │   ├── db.go            ← pgx pool + WithTenantSchema helper
 │       │   ├── repository.go    ← status updates (MarkRunning, MarkFailed, dll)
-│       │   └── queries/         ← [belum ada] semua SQL queries (load + write)
-│       ├── mrp/                 ← [belum ada] loader + writer (orchestrate queries)
-│       └── queue/               ← [belum ada] BullMQ consumer (gobullmq)
+│       ├── mrp/                 ← engine, loader, guarded idempotent writer
+│       └── queue/               ← BullMQ-compatible worker
 ├── docs/
 │   ├── session.md               ← session summary & keputusan arsitektur
 │   └── mrp-engine-full-plan.md  ← PRD + System Design + Task List lengkap
@@ -178,7 +179,7 @@ Format JSON yang dikirim NestJS ke Redis queue dan dibaca service ini.
 
 ```json
 {
-  "id": "mrp-run-3",
+  "id": "mrp-companyabc-run-3",
   "name": "mrp-calculation",
   "data": {
     "schemaVersion": 1,
@@ -189,7 +190,7 @@ Format JSON yang dikirim NestJS ke Redis queue dan dibaca service ini.
     "triggeredBy": 7
   },
   "opts": {
-    "jobId": "mrp-run-3",
+    "jobId": "mrp-companyabc-run-3",
     "attempts": 1,
     "removeOnComplete": false,
     "removeOnFail": false
@@ -201,7 +202,8 @@ Format JSON yang dikirim NestJS ke Redis queue dan dibaca service ini.
 
 - `runId` dan `triggeredBy` adalah **integer (BIGINT)**, bukan UUID string
 - `planFrom`/`planTo` harus format **RFC3339 lengkap** (`.toISOString()` dari NestJS)
-- `jobId` harus ber-prefix string `mrp-run-${runId}` — BullMQ v5 menolak jobId integer murni
+- `jobId` wajib `mrp-${tenantCode}-run-${runId}` agar unik lintas schema tenant;
+  run ID sendiri tidak global
 - `schemaVersion` mismatch → Go reject dengan `failed_permanent` **langsung tanpa retry**
 - `opts.attempts: 1` — job-level retry dimatikan di BullMQ, di-handle oleh `MrpReconciliationService` NestJS
 
@@ -230,6 +232,7 @@ Job selesai
 - Kegagalan transient → `status='failed'`, NestJS reconciliation retry (max 3x)
 - Schema version mismatch → `status='failed_permanent'` langsung, skip retry
 - Retry ke-3 gagal → NestJS set `status='failed_permanent'`
+- Pembatalan `pending/running → cancelled`; writer hanya menulis bila row masih `running`
 
 ---
 
@@ -241,7 +244,7 @@ Semua keputusan di bawah sudah di-commit ke schema dan code. Jangan ubah tanpa d
 |---|---|
 | Semua ID adalah `int64` | BIGINT GENERATED ALWAYS AS IDENTITY — Go tidak bisa pre-generate, harus `RETURNING id` setelah insert |
 | `QueryExecModeSimpleProtocol` | **Wajib** untuk pgx + PgBouncer transaction mode. Tanpa ini, prepared statement cache per-koneksi menyebabkan bug intermiten |
-| `SET search_path` eksplisit | Setiap transaksi wajib set `search_path TO tenant_xxx, public` — tidak ada interceptor seperti NestJS |
+| `SET LOCAL search_path` eksplisit | Setiap transaksi wajib set lokal `search_path TO tenant_xxx, public` agar aman pada pool/PgBouncer transaction mode |
 | Write dalam satu transaksi | `planned_orders`, `planned_order_demands`, status update — commit/rollback bersama |
 | Job retry: rekonsiliasi NestJS | `MRP_RETRY_ATTEMPTS` di Go = retry koneksi DB internal. Job-level retry = `MrpReconciliationService` NestJS |
 | Queue name: `mrp-calculation` | Identik dengan `BullModule.registerQueue({ name: 'mrp-calculation' })` di NestJS |
@@ -270,12 +273,12 @@ Semua keputusan di bawah sudah di-commit ke schema dan code. Jangan ubah tanpa d
 - Redis queue name: `mrp-calculation` (bukan `mrp-jobs` atau variant lain)
 
 **Error `permission denied for schema tenant_xxx`**
-- Role `mrp_service` harus sudah dibuat via `004_create_mrp_service_role.sql`
-- Migration 012 (`012_mrp_engine_service_support.sql`) harus sudah dijalankan di tenant schema
-- User database butuh `CREATEROLE`: `ALTER USER synkro_erp WITH CREATEROLE;`
+- Pastikan public migration 007 dan tenant migration 012-016 sudah dijalankan
+- Jalankan `npm run db:provision-mrp-role` dari backend dengan
+  `MRP_SERVICE_PASSWORD` tersedia hanya di environment lokal
 
 **Error `Custom Id cannot be integers`**
-- Pastikan NestJS menggunakan format `jobId: mrp-run-${runId}` (dengan prefix string)
+- Pastikan NestJS menggunakan `jobId: mrp-${tenantCode}-run-${runId}`
 
 **`started_at` tidak terupdate setelah job pickup**
 - `MarkRunning` pakai `WHERE id=$1 AND status='pending'` — jika `rowsAffected=0`, berarti run sudah dipegang worker lain atau statusnya bukan `pending`

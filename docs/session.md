@@ -1,11 +1,17 @@
-# Status note — 2026-10-26
+# Status note — 2026-10-28
 
 This document contains historical session notes. The current implementation
 source of truth is the worker README and the backend `docs/planning.md`.
 
-Verified baseline: unit/race tests pass; tagged integration tests require an
-explicit test database; worker claims runs in a short transaction, writes only
-while status is `running`, and planned-order writes are idempotent.
+Verified baseline: unit/race tests pass; tagged PostgreSQL integration tests
+cover visible claim, double-claim prevention, cancellation guard, idempotent
+retry, and schema-version terminal failure. Worker claims runs in a short
+transaction and writes only while status is `running`. E2E lokal dua tenant dari
+NestJS melalui Redis/BullMQ ke worker Go mencapai `completed` pada 2026-10-28.
+
+Semua bagian setelah catatan ini adalah histori keputusan. Klaim lama tentang
+worker stub, job ID tanpa tenant, atau komponen yang belum dibuat tidak lagi
+menggambarkan kode saat ini.
 
 # Session Summary — ERP Manufaktur SaaS
 
