@@ -59,7 +59,7 @@ menulis output ke `planned_orders` + `planned_order_demands`.
 - **Go 1.22+** (project pakai Go 1.25, min requirement Go 1.22 untuk `range-over-func`)
 - **PostgreSQL 16** dengan schema tenant yang sudah dijalankan migration 001-016
 - **Redis 7+** — instance yang sama dengan NestJS backend
-- **PgBouncer** — Go connect lewat PgBouncer (transaction mode), bukan direct ke Postgres
+- PostgreSQL dapat diakses langsung atau lewat PgBouncer transaction mode
 - Role Postgres `mrp_service` dibuat tanpa password oleh migration public
   `007_create_mrp_service_role.sql`, lalu password login dipasang dari secret lokal
   melalui `npm run db:provision-mrp-role` di backend
@@ -81,7 +81,7 @@ go mod download
 ```bash
 cp .env.example .env
 # Edit .env — minimal wajib set:
-# MRP_DATABASE_URL=postgres://mrp_service:<password>@<pgbouncer-host>:6432/erpdb
+# MRP_DATABASE_URL=postgres://mrp_service:<password>@<postgres-or-pgbouncer-host>:5432/erpdb
 # REDIS_ADDR=<redis-host>:6379
 ```
 
@@ -109,11 +109,22 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Integration tests (database/schema test dibuat ulang oleh helper)
-TEST_DATABASE_URL="postgres://..." go test -tags integration ./...
+TEST_DATABASE_URL="postgres://.../erp_test?sslmode=disable" go test -race -tags integration ./test/integration
 
 # Race condition detection
 go test -race ./...
 ```
+
+### Deployment artifacts
+
+- `Dockerfile` builds a static Linux worker image and runs it as UID 10001. Pass
+  `MRP_DATABASE_URL` and `REDIS_ADDR` as runtime environment variables or secrets;
+  they are not copied into the image.
+- `scripts/worker_supervisor.sh` starts `bin/mrp-worker`; if the binary is absent,
+  it builds it from the checked-out source before starting the restart loop.
+- `deploy/systemd/mrp-worker.service` is a Linux systemd template. Adjust the
+  installation directory and service account for the target host, and store
+  runtime secrets in its `EnvironmentFile` outside Git.
 
 ---
 
@@ -121,7 +132,7 @@ go test -race ./...
 
 | Variabel | Default | Keterangan |
 |---|---|---|
-| `MRP_DATABASE_URL` | — **(wajib)** | Koneksi ke PostgreSQL **lewat PgBouncer**, bukan direct. Format: `postgres://mrp_service:<pwd>@<host>:6432/<db>` |
+| `MRP_DATABASE_URL` | — **(wajib)** | Koneksi PostgreSQL langsung atau lewat PgBouncer. Format: `postgres://mrp_service:<pwd>@<host>:5432/<db>` |
 | `REDIS_ADDR` | — **(wajib)** | Address Redis. Format: `<host>:6379` |
 | `REDIS_QUEUE_NAME` | `mrp-calculation` | Harus identik dengan nama queue di NestJS `BullModule.registerQueue()` |
 | `MRP_WORKER_CONCURRENCY` | `5` | Jumlah job yang diproses paralel |
@@ -162,9 +173,12 @@ erp-mrp-engine/
 │       │   ├── repository.go    ← status updates (MarkRunning, MarkFailed, dll)
 │       ├── mrp/                 ← engine, loader, guarded idempotent writer
 │       └── queue/               ← BullMQ-compatible worker
+├── deploy/systemd/mrp-worker.service
+├── scripts/worker_supervisor.sh
 ├── docs/
-│   ├── session.md               ← session summary & keputusan arsitektur
-│   └── mrp-engine-full-plan.md  ← PRD + System Design + Task List lengkap
+│   ├── session.md               ← current status + historical decisions
+│   ├── mrp-test-validation-report.md
+│   └── mrp-engine-full-plan.md  ← archived design plan
 ├── go.mod
 ├── go.sum
 └── .env.example
@@ -243,7 +257,7 @@ Semua keputusan di bawah sudah di-commit ke schema dan code. Jangan ubah tanpa d
 | Keputusan | Detail |
 |---|---|
 | Semua ID adalah `int64` | BIGINT GENERATED ALWAYS AS IDENTITY — Go tidak bisa pre-generate, harus `RETURNING id` setelah insert |
-| `QueryExecModeSimpleProtocol` | **Wajib** untuk pgx + PgBouncer transaction mode. Tanpa ini, prepared statement cache per-koneksi menyebabkan bug intermiten |
+| `QueryExecModeSimpleProtocol` | **Wajib** untuk mendukung pgx + PgBouncer transaction mode tanpa prepared statement cache per koneksi |
 | `SET LOCAL search_path` eksplisit | Setiap transaksi wajib set lokal `search_path TO tenant_xxx, public` agar aman pada pool/PgBouncer transaction mode |
 | Write dalam satu transaksi | `planned_orders`, `planned_order_demands`, status update — commit/rollback bersama |
 | Job retry: rekonsiliasi NestJS | `MRP_RETRY_ATTEMPTS` di Go = retry koneksi DB internal. Job-level retry = `MrpReconciliationService` NestJS |
@@ -266,7 +280,7 @@ Semua keputusan di bawah sudah di-commit ke schema dan code. Jangan ubah tanpa d
 
 **Worker startup gagal: `connection refused`**
 - Pastikan PostgreSQL dan Redis berjalan dan bisa diakses dari mesin ini
-- Cek `MRP_DATABASE_URL` mengarah ke PgBouncer, bukan direct ke PostgreSQL
+- Pastikan `MRP_DATABASE_URL` mengarah ke PostgreSQL atau PgBouncer yang benar
 
 **Job masuk tapi tidak diproses**
 - Pastikan `REDIS_QUEUE_NAME` sama persis dengan nama queue di NestJS
@@ -287,6 +301,6 @@ Semua keputusan di bawah sudah di-commit ke schema dan code. Jangan ubah tanpa d
 
 ## Dokumentasi Lebih Lanjut
 
-- [`docs/mrp-engine-full-plan.md`](./docs/mrp-engine-full-plan.md) — PRD, System Design, Task List, semua SQL queries, algoritma BOM Exploder
+- [`docs/mrp-engine-full-plan.md`](./docs/mrp-engine-full-plan.md) — arsip PRD, System Design, dan task list; status saat ini mengikuti README ini
 - [`docs/session.md`](./docs/session.md) — ringkasan keputusan arsitektur keseluruhan ERP (termasuk keputusan yang tidak boleh diubah)
 - `mrp-job-contract.schema.json` — JSON Schema untuk validasi payload job

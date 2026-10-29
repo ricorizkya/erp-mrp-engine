@@ -1,0 +1,10 @@
+.git
+.agents
+.claude
+.env
+.env.*
+!.env.example
+*.log
+coverage.out
+.DS_Store
+bin/

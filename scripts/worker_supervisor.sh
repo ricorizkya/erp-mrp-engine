@@ -9,18 +9,19 @@
 WORKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKER_BIN="$WORKER_DIR/bin/mrp-worker"
 
+if [ ! -f "$WORKER_BIN" ]; then
+    echo "[Supervisor] Worker binary not found. Building from source..."
+    mkdir -p "$WORKER_DIR/bin"
+    (cd "$WORKER_DIR" && go build -o "$WORKER_BIN" ./cmd/worker) || exit 1
+fi
+
 echo "[Supervisor] ==============================================="
 echo "[Supervisor] Starting Go MRP Worker Supervisor..."
 echo "[Supervisor] Target Binary: $WORKER_BIN"
 echo "[Supervisor] Supervisor PID: $$"
 echo "[Supervisor] ==============================================="
 
-if [ ! -f "$WORKER_BIN" ]; then
-    echo "[Supervisor] ERROR: Binary $WORKER_BIN tidak ditemukan! Build terlebih dahulu."
-    exit 1
-fi
-
-trap 'echo "[Supervisor] Menerima sinyal terminasi. Menghentikan supervisor dan child..."; kill $CHILD_PID 2>/dev/null; exit 0' SIGINT SIGTERM
+trap 'echo "[Supervisor] Menerima sinyal terminasi. Menghentikan supervisor dan child..."; kill "$CHILD_PID" 2>/dev/null; wait "$CHILD_PID" 2>/dev/null; exit 0' SIGINT SIGTERM
 
 RESTART_COUNT=0
 
@@ -31,7 +32,7 @@ while true; do
     echo "[Supervisor] Worker spawned dengan PID: $CHILD_PID"
     
     # Tunggu sampai child proses selesai/mati
-    wait $CHILD_PID
+    wait "$CHILD_PID"
     EXIT_CODE=$?
     
     RESTART_COUNT=$((RESTART_COUNT + 1))
